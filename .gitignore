@@ -3,6 +3,9 @@
 .piolibdeps
 .vscode/
 
+.cache/
+compile_commands.json
+
 # Mac stuff
 .DS_Store
 

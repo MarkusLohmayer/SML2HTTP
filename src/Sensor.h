@@ -20,8 +20,8 @@ enum State
     STANDBY,
     WAIT_FOR_START_SEQUENCE,
     READ_MESSAGE,
-    PROCESS_MESSAGE,
-    READ_CHECKSUM
+    READ_CHECKSUM,
+    PROCESS_MESSAGE
 };
 
 uint64_t millis64()
@@ -183,6 +183,7 @@ private:
         this->init_state();
     }
 
+    // STANDBY function
     void standby()
     {
         // Keep buffers clean
@@ -198,6 +199,7 @@ private:
         }
     }
 
+    // WAIT_FOR_START_SEQUENCE function
     // Wait for the start_sequence to appear
     void wait_for_start_sequence()
     {
@@ -221,6 +223,7 @@ private:
         }
     }
 
+    // READ_MESSAGE function
     // Read the rest of the message
     void read_message()
     {
@@ -253,6 +256,7 @@ private:
         }
     }
 
+    // READ_CHECKSUM function
     // Read the number of fillbytes and the checksum
     void read_checksum()
     {
@@ -271,10 +275,13 @@ private:
         }
     }
 
+    // PROCESS_MESSAGE function
+    // Call process_message function in main.cpp
     void process_message()
     {
         DEBUG("Message is being processed.");
 
+        // TODO why is this called first?
         if (this->config->interval > 0)
         {
             this->standby_until = millis64() + (this->config->interval * 1000);

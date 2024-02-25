@@ -1,143 +1,135 @@
-#include <list>
+#include "EEPROM.h"
+
+#include "Sensor.h"
 #include "config.h"
 #include "debug.h"
-#include <sml/sml_file.h>
-#include "Sensor.h"
-#include <IotWebConf.h>
-#include "MqttPublisher.h"
-#include "EEPROM.h"
-#include <ESP8266WiFi.h>
+
 #include <ESP8266WebServer.h>
-#include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266WiFi.h>
+#include <IotWebConf.h>
+#include <ArduinoJson.h>
+#include <list>
+#include <sml/sml_file.h>
 
-std::list<Sensor *> *sensors = new std::list<Sensor *>();
+// Sensor is a state machine
+Sensor *sensor;
 
+// WiFi
+WiFiClient net;
+
+// Web server
+DNSServer dnsServer;
+WebServer server(80);
+
+// Callback functions for IotWebConf
 void wifiConnected();
 void configSaved();
 
-DNSServer dnsServer;
-WebServer server(80);
-ESP8266HTTPUpdateServer httpUpdater;
-WiFiClient net;
+IotWebConf iotWebConf(WIFI_AP_SSID, &dnsServer, &server,
+                      WIFI_AP_DEFAULT_PASSWORD, CONFIG_VERSION);
 
-MqttConfig mqttConfig;
-MqttPublisher publisher;
-
-IotWebConf iotWebConf(WIFI_AP_SSID, &dnsServer, &server, WIFI_AP_DEFAULT_PASSWORD, CONFIG_VERSION);
-
-iotwebconf::TextParameter mqttServerParam = iotwebconf::TextParameter("MQTT server", "mqttServer", mqttConfig.server, sizeof(mqttConfig.server), nullptr, mqttConfig.server);
-iotwebconf::NumberParameter mqttPortParam = iotwebconf::NumberParameter("MQTT port", "mqttPort", mqttConfig.port, sizeof(mqttConfig.port), nullptr, mqttConfig.port);
-iotwebconf::TextParameter mqttUsernameParam = iotwebconf::TextParameter("MQTT username", "mqttUsername", mqttConfig.username, sizeof(mqttConfig.username), nullptr, mqttConfig.username);
-iotwebconf::PasswordParameter mqttPasswordParam = iotwebconf::PasswordParameter("MQTT password", "mqttPassword", mqttConfig.password, sizeof(mqttConfig.password), nullptr, mqttConfig.password);
-iotwebconf::TextParameter mqttTopicParam = iotwebconf::TextParameter("MQTT topic", "mqttTopic", mqttConfig.topic, sizeof(mqttConfig.topic), nullptr, mqttConfig.topic);
-iotwebconf::ParameterGroup paramGroup = iotwebconf::ParameterGroup("MQTT Settings", "");
-
+// Implicit state machine
 boolean needReset = false;
 
-void process_message(byte *buffer, size_t len, Sensor *sensor)
-{
-	// Parse
-	sml_file *file = sml_file_parse(buffer + 8, len - 16);
+// Active power consumed from grid
+double power = 0;
 
-	DEBUG_SML_FILE(file);
+// Callback that handles a  sensor reading
+void process_message(byte *buffer, size_t len, Sensor *sensor) {
+  sml_file *file = sml_file_parse(buffer + 8, len - 16);
 
-	publisher.publish(sensor, file);
+  for (int i = 0; i < file->messages_len; i++)
+  {
+    sml_message *message = file->messages[i];
+    if (*message->message_body->tag == SML_MESSAGE_GET_LIST_RESPONSE)
+    {
+      sml_list *entry;
+      sml_get_list_response *body;
+      body = (sml_get_list_response *)message->message_body->data;
+      for (entry = body->val_list; entry != NULL; entry = entry->next)
+      {
+        // don't crash on empty value
+        if (!entry->value) { continue; }
+        // filter relevant readings
+        if (entry->obj_name->str[0] != 1) { continue; }
+        if (entry->obj_name->str[1] != 0) { continue; }
+        if (entry->obj_name->str[4] != 0) { continue; }
+
+        double value = sml_value_to_double(entry->value);
+        int scaler = (entry->scaler) ? *entry->scaler : 0;
+        int prec = -scaler;
+        if (prec < 0)
+          prec = 0;
+        value = value * pow(10, scaler);
+
+        power = value;
+      }
+    }
+  }
 
 	// free the malloc'd memory
 	sml_file_free(file);
 }
 
-void setup()
-{
-	// Setup debugging stuff
-	SERIAL_DEBUG_SETUP(115200);
 
-#ifdef DEBUG
-	// Delay for getting a serial console attached in time
-	delay(2000);
-#endif
+void webResponse() {
+  StaticJsonDocument<200> jsonDoc;
+  jsonDoc["power"] = power;
 
-	// Setup reading heads
-	DEBUG("Setting up %d configured sensors...", NUM_OF_SENSORS);
-	const SensorConfig *config = SENSOR_CONFIGS;
-	for (uint8_t i = 0; i < NUM_OF_SENSORS; i++, config++)
-	{
-		Sensor *sensor = new Sensor(config, process_message);
-		sensors->push_back(sensor);
-	}
-	DEBUG("Sensor setup done.");
+  String jsonString;
+  serializeJson(jsonDoc, jsonString);
 
-	// Initialize publisher
-	// Setup WiFi and config stuff
-	DEBUG("Setting up WiFi and config stuff.");
-
-	paramGroup.addItem(&mqttServerParam);
-	paramGroup.addItem(&mqttPortParam);
-	paramGroup.addItem(&mqttUsernameParam);
-	paramGroup.addItem(&mqttPasswordParam);
-	paramGroup.addItem(&mqttTopicParam);
-
-	iotWebConf.addParameterGroup(&paramGroup);
-
-	iotWebConf.setConfigSavedCallback(&configSaved);
-	iotWebConf.setWifiConnectionCallback(&wifiConnected);
-
-
-	WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& event) {
-      publisher.disconnect();
-    });
-
-	// -- Define how to handle updateServer calls.
-	iotWebConf.setupUpdateServer(
-		[](const char *updatePath)
-		{ httpUpdater.setup(&server, updatePath); },
-		[](const char *userName, char *password)
-		{ httpUpdater.updateCredentials(userName, password); });
-
-	boolean validConfig = iotWebConf.init();
-	if (!validConfig)
-	{
-		DEBUG("Missing or invalid config. MQTT publisher disabled.");
-	}
-	else
-	{
-		// Setup MQTT publisher
-		publisher.setup(mqttConfig);
-	}
-
-	server.on("/", []() { iotWebConf.handleConfig(); });
-	server.on("/reset", []() { needReset = true; });
-	server.onNotFound([]() { iotWebConf.handleNotFound(); });
-
-	DEBUG("Setup done.");
+  server.send(200, "application/json", jsonString);
 }
 
-void loop()
-{
-	if (needReset)
-	{
-		// Doing a chip reset caused by config changes
-		DEBUG("Rebooting after 1 second.");
-		delay(1000);
-		ESP.restart();
-	}
 
-	// Execute sensor state machines
-	for (std::list<Sensor*>::iterator it = sensors->begin(); it != sensors->end(); ++it){
-		(*it)->loop();
-	}
-	iotWebConf.doLoop();
-	yield();
+// Arduino setup()
+void setup() {
+  sensor = new Sensor(&SENSOR_CONFIG, process_message);
+
+  iotWebConf.setConfigSavedCallback(&configSaved);
+  iotWebConf.setWifiConnectionCallback(&wifiConnected);
+
+  // WiFi.onStationModeDisconnected(
+  //     [](const WiFiEventStationModeDisconnected &event) {
+  //       publisher.disconnect();
+  //     });
+
+  boolean validConfig = iotWebConf.init();
+  if (!validConfig) {
+    DEBUG("Missing or invalid config.");
+  }
+
+  server.on("/", []() { webResponse(); });
+  server.on("/setup", []() { iotWebConf.handleConfig(); });
+  server.on("/reset", []() { needReset = true; });
+  server.onNotFound([]() { iotWebConf.handleNotFound(); });
+
+  DEBUG("Setup done.");
 }
 
-void configSaved()
-{
-	DEBUG("Configuration was updated.");
-	needReset = true;
+// Arduino loop()
+void loop() {
+  if (needReset) {
+    // Doing a chip reset caused by config changes
+    DEBUG("Rebooting after 1 second.");
+    delay(1000);
+    ESP.restart();
+  }
+
+  // Execute sensor state machines
+  sensor->loop();
+  iotWebConf.doLoop();
+  yield();
 }
 
-void wifiConnected()
-{
-	DEBUG("WiFi connection established.");
-	publisher.connect();
+// IotWebConf config saved callback
+void configSaved() {
+  DEBUG("Configuration was updated.");
+  needReset = true;
+}
+
+// IotWebConf config WiFi connected callback
+void wifiConnected() {
+  DEBUG("WiFi connection established.");
 }
